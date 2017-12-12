@@ -10,7 +10,9 @@ import os
 from tensorpack import *
 from tensorpack.tfutils.summary import add_moving_summary, add_param_summary
 from tensorpack.utils.gpu import get_nr_gpu
+from tensorpack.utils.naming import GLOBAL_STEP_INCR_OP_NAME
 from tensorpack.dataflow import dataset
+from tensorpack.callbacks.steps import MaintainStepCounter
 
 import tensorflow as tf
 from tensorflow.contrib.layers import variance_scaling_initializer
@@ -35,11 +37,58 @@ BATCH_SIZE = 128
 NUM_UNITS = None
 
 
+class MaintainGlobalStepIterSizeCounter(Callback):
+    """
+    It maintains the global step based on iter_size in the graph,
+    making sure it's increased by one when iter_size reached.
+    """
+
+    _chief_only = False
+    """
+    In distributed training, we let each worker maintain its local global_step.
+    """
+    
+    def __init__(self, iter_size=1):
+        assert iter_size > 0
+        self._iter_size = iter_size
+        self._counter = 0
+    
+    def _setup_graph(self):
+        # ensure it exists
+        gs_var = get_global_step_var()
+        with tf.name_scope(None):
+            with self.graph.colocate_with(gs_var):
+                self.gs_incr_op = tf.assign_add(
+                    gs_var, 1,
+                    name=GLOBAL_STEP_INCR_OP_NAME).op
+        self._fetches = tf.train.SessionRunArgs(self.gs_incr_op)
+    
+    def _before_train(self):
+        if self.global_step != 0:
+            logger.info("Start training with global_step={}".format(self.global_step))
+    
+    def _before_run(self, _):
+        # always increase global_step when hooked_sess.run is called
+        return self._fetches
+    
+    def _after_run(self, _, __):
+        # Keep python-side global_step in agreement with TF-side
+        if(self._iter_size == 1):
+          return
+        if(self._counter < self._iter_size - 1):
+            self._counter += 1
+        else:
+            self.trainer.loop._global_step += 1
+            self._counter = 0
+
+
+
 class Model(ModelDesc):
 
-    def __init__(self, n):
+    def __init__(self, n, iter_size):
         super(Model, self).__init__()
         self.n = n
+        self._iter_size = iter_size
 
     def _get_inputs(self):
         return [InputDesc(tf.float32, [None, 32, 32, 3], 'input'),
@@ -116,7 +165,7 @@ class Model(ModelDesc):
     def _get_optimizer(self):
         lr = tf.get_variable('learning_rate', initializer=0.01, trainable=False)
         opt = tf.train.MomentumOptimizer(lr, 0.9)
-        return opt
+        return optimizer.AccumGradOptimizer(opt, self._iter_size)
 
 
 def get_data(train_or_test):
@@ -148,11 +197,16 @@ if __name__ == '__main__':
                         help='number of units in each stage',
                         type=int, default=18)
     parser.add_argument('--load', help='load model')
+    parser.add_argument('-is', '--iter_size',
+                        help='number of iteration for gradient accumulation in the graph',
+                        type=int, default=1)
     args = parser.parse_args()
     NUM_UNITS = args.num_units
+    ITER_SIZE = args.iter_size
 
     if args.gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    
 
     logger.auto_set_dir()
 
@@ -160,10 +214,11 @@ if __name__ == '__main__':
     dataset_test = get_data('test')
 
     config = TrainConfig(
-        model=Model(n=NUM_UNITS),
+        model=Model(n=NUM_UNITS, iter_size=ITER_SIZE),
         dataflow=dataset_train,
         callbacks=[
             ModelSaver(),
+            MaintainGlobalStepIterSizeCounter(ITER_SIZE),
             InferenceRunner(dataset_test,
                             [ScalarStats('cost'), ClassificationError('wrong_vector')]),
             ScheduledHyperParamSetter('learning_rate',
